@@ -1,0 +1,247 @@
+#PROBLEMA 1 TP3 PDI GRUPO 5
+
+#IMPORTACION DE LIBRERIAS
+import cv2
+import numpy as np
+import os
+import sys
+
+
+#PARAMETROS
+UMBRAL_DIFF       = 1.0    #dif max entre frames para considerarlos estaticos
+MIN_FRAMES_EST    = 10     #min de frames estaticos consecutivos para ser una tirada
+DADO_AREA_MIN     = 1500   #area min de un dado (px²)
+DADO_AREA_MAX     = 150000 #area max de un dado (px²)
+DADO_ASPECTO_MIN  = 0.4    #AR min del bounding box
+DADO_ASPECTO_MAX  = 2.5    #AR max del bounding box
+PUNTO_AREA_MIN    = 20     #area min de un punto del dado (px²)
+PUNTO_SAT_MAX     = 60     #sat max del blanco de los puntos
+PUNTO_BRILL_MIN   = 180    #brillo min del blanco de los puntos
+DADO_MARGEN       = 8      #margen extra al recortar un dado
+CANT_DADOS        = 5      #cant de dados esperada por tirada
+VALOR_MIN         = 1      #valor min válido de un dado
+VALOR_MAX         = 6      #valor max válido de un dado
+MERGE_GAP_MAX     = 5      #gap max de frames entre periodos para fusionar tiradas con igual resultado
+
+
+#DETECCION
+def detectar_periodos_estaticos(ruta_video):
+    """Retorna lista de periodos {'inicio', 'fin', 'centro', 'largo'} donde la escena es estática."""
+    cap = cv2.VideoCapture(ruta_video)
+    tot_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Analizando {tot_frames} frames a {fps:.1f} FPS...")
+
+    gris_ant, difs = None, []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        difs.append(float(np.mean(cv2.absdiff(gris, gris_ant))) if gris_ant is not None else 0.0)
+        gris_ant = gris
+    cap.release()
+
+    es_estatico = [d < UMBRAL_DIFF for d in difs]
+    periodos, i = [], 0
+    while i < len(es_estatico):
+        if es_estatico[i]:
+            j = i
+            while j < len(es_estatico) and es_estatico[j]:
+                j += 1
+            if j - i >= MIN_FRAMES_EST:
+                periodos.append({'inicio': i, 'fin': j-1, 'centro': (i+j)//2, 'largo': j-i})
+            i = j
+        else:
+            i += 1
+    return periodos
+
+
+def detectar_dados(frame):
+    """Detecta dados rojos; retorna lista de bboxes (x, y, ancho, alto) de izq. a der."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mascara = cv2.bitwise_or(
+        cv2.inRange(hsv, np.array([0,   80, 80]), np.array([15,  255, 255])),
+        cv2.inRange(hsv, np.array([155, 80, 80]), np.array([180, 255, 255]))
+    )
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)) #rellena huecos chicos dentro de un dado
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN,  np.ones((3, 3), np.uint8)) #limpia ruido pequeño fuera de los dados
+
+    bboxes = []
+    for cont in cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        area = cv2.contourArea(cont)
+        if DADO_AREA_MIN < area < DADO_AREA_MAX:
+            x, y, ancho, alto = cv2.boundingRect(cont)
+            if DADO_ASPECTO_MIN < ancho / alto < DADO_ASPECTO_MAX:
+                bboxes.append((x, y, ancho, alto))
+    return sorted(bboxes, key=lambda b: b[0])
+
+
+def contar_puntos(frame, x, y, ancho, alto):
+    """Cuenta los puntos blancos dentro del bounding box de un dado."""
+    H, W = frame.shape[:2]
+    #recorta region del dado c margen 
+    recorte = frame[max(0, y-DADO_MARGEN) : min(H, y+alto+DADO_MARGEN), max(0, x-DADO_MARGEN) : min(W, x+ancho+DADO_MARGEN)]
+    mascara = cv2.inRange(cv2.cvtColor(recorte, cv2.COLOR_BGR2HSV), np.array([0, 0,PUNTO_BRILL_MIN]), np.array([180, PUNTO_SAT_MAX, 255]))
+    contornos = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    return sum(1 for c in contornos if cv2.contourArea(c) > PUNTO_AREA_MIN)
+
+#VALIDACION
+def validar(dados):
+    """Retorna lista de errores: cantidad != 5 o valor fuera de [1,6]."""
+    errores = []
+    if len(dados) != CANT_DADOS:
+        errores.append(f"Cantidad incorrecta: {len(dados)} dados (esperados {CANT_DADOS}).")
+    for d in dados:
+        if not (VALOR_MIN <= d['valor'] <= VALOR_MAX):
+            errores.append(f"Valor inválido en D{d['id']}: {d['valor']} (debe ser {VALOR_MIN}–{VALOR_MAX}).")
+    return errores
+
+
+#DIBUJO
+def dibujar(frame, dados):
+    """Dibuja bboxes y etiquetas sobre el frame. Verde=OK, Rojo=valor inválido."""
+    salida = frame.copy()
+    for d in dados:
+        x, y, ancho, alto = d['bbox']
+        valido = VALOR_MIN <= d['valor'] <= VALOR_MAX
+        color  = (0, 220, 0) if valido else (0, 0, 220)
+        etiq   = f"D{d['id']}-{d['valor']}" if valido else f"D{d['id']}-ERR({d['valor']})"
+
+        cv2.rectangle(salida, (x, y), (x+ancho, y+alto), color, 3)
+
+        fuente, escala, grosor = cv2.FONT_HERSHEY_SIMPLEX, max(0.8, ancho/70), 2
+        (tw, th), bl = cv2.getTextSize(etiq, fuente, escala, grosor)
+        ty = max(th + 5, y - 5)
+        cv2.rectangle(salida, (x-2, ty-th-2), (x+tw+2, ty+bl), (0, 0, 0), -1)
+        cv2.putText(salida, etiq, (x, ty), fuente, escala,
+                    (0, 255, 0) if valido else (0, 0, 255), grosor, cv2.LINE_AA)
+    return salida
+
+
+#RESULTADO INTERMEDIO
+def guardar_resultado(frame, dados, idx, nombre_video, carpeta="output/debug"):
+    """Guarda una imagen con el resultado de una tirada detectada, para verificación visual."""
+    os.makedirs(carpeta, exist_ok=True)
+    img = dibujar(frame, dados)
+    ruta = os.path.join(carpeta, f"{nombre_video}_tirada_{idx}.jpg")
+    cv2.imwrite(ruta, img)
+    print(f"  Resultado guardado: {ruta}")
+
+
+#PROCES DE UN VIDEO
+def procesar_video(ruta_entrada, ruta_salida):
+    nombre = os.path.basename(ruta_entrada)
+    print(f"Procesando:{nombre}")
+
+    #A)períodos estáticos
+    periodos = detectar_periodos_estaticos(ruta_entrada)
+    if not periodos:
+        print("No se detectaron períodos estáticos.")
+        return []
+
+    print(f"Periodos estáticos: {len(periodos)}")
+    for p in periodos:
+        print(f"Frames {p['inicio']:3d}–{p['fin']:3d}  ({p['largo']} frames, central: {p['centro']})")
+
+    #B)analizar dados + filtrar vacíos + deduplicar tiradas iguales
+    cap = cv2.VideoCapture(ruta_entrada)
+    ancho_vid = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    alto_vid  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps       = cap.get(cv2.CAP_PROP_FPS)
+
+    tiradas = []
+    for p in periodos:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, p['centro']) 
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        dados = [{'id': i+1, 'bbox': b, 'valor': contar_puntos(frame, *b)}
+                 for i, b in enumerate(detectar_dados(frame))]
+        if not dados:
+            continue
+        #si el resultado es igual al anterior, solo extender el período
+        if tiradas and [d['valor'] for d in tiradas[-1][1]] == [d['valor'] for d in dados] \
+                and p['inicio'] - tiradas[-1][0]['fin'] <= MERGE_GAP_MAX:  #solo si están cerca en el tiempo
+            pp = tiradas[-1][0]
+            tiradas[-1] = ({'inicio': pp['inicio'], 'fin': p['fin'],
+                            'centro': (pp['inicio'] + p['fin']) // 2,
+                            'largo':   p['fin'] - pp['inicio'] + 1}, tiradas[-1][1])
+        else:
+            tiradas.append((p, dados))
+            guardar_resultado(frame, dados, len(tiradas), nombre, os.path.join(os.path.dirname(ruta_salida), 'debug'))
+
+    print(f"Tiradas válidas: {len(tiradas)}")
+    for i, (p, dados) in enumerate(tiradas):
+        etiquetas = [f"D{d['id']}-{d['valor']}" for d in dados]
+        total     = sum(d['valor'] for d in dados)
+        errores   = validar(dados)
+        print(f"Tirada {i+1} – frames {p['inicio']}–{p['fin']} (central: {p['centro']}):")
+        print(f"Dados: {', '.join(etiquetas)}  |  Total: {total}")
+        if errores:
+            for e in errores:
+                print(f"ERROR: {e}")
+        else:
+            print(f"OK: {CANT_DADOS} dados, valores entre {VALOR_MIN} y {VALOR_MAX}.\n ")
+
+    #C)generar video de salida
+    print(f"Generando: {os.path.basename(ruta_salida)}")
+    escritor = cv2.VideoWriter(ruta_salida, cv2.VideoWriter_fourcc(*'mp4v'),
+                               fps, (ancho_vid, alto_vid))
+
+    mapa_frames = {nf: dados for p, dados in tiradas for nf in range(p['inicio'], p['fin']+1)}
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    num_frame = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if num_frame in mapa_frames:
+            frame = dibujar(frame, mapa_frames[num_frame])
+        escritor.write(frame)
+        num_frame += 1
+
+    cap.release()
+    escritor.release()
+    print(f"Guardado: {ruta_salida}")
+    return [dados for _, dados in tiradas]
+
+
+#MAIN
+def main():
+    carpeta_entrada = '.'        #carpeta con tirada_*.mp4
+    carpeta_salida  = './output' #carpeta de salida
+    os.makedirs(carpeta_salida, exist_ok=True)
+
+    videos = sorted(f for f in os.listdir(carpeta_entrada)
+                    if f.startswith('tirada_') and f.endswith('.mp4'))
+    if not videos:
+        print("No se encontraron archivos tirada_*.mp4.")
+        sys.exit(1)
+
+    print("TUIA PDI TP3 2026 Detección Automática de Dados")
+    print(f"  Videos: {', '.join(videos)}")
+
+    todos_resultados = {
+        vid: procesar_video(os.path.join(carpeta_entrada, vid), os.path.join(carpeta_salida, vid.replace('.mp4', '_resultado.mp4')))
+        for vid in videos
+    }
+
+    print("RESUMEN FINAL")
+    for vid, tiradas in todos_resultados.items():
+        print(f"\n  {vid}:")
+        for i, dados in enumerate(tiradas):
+            etiquetas = [f"D{d['id']}-{d['valor']}" for d in dados]
+            total     = sum(d['valor'] for d in dados)
+            errores   = validar(dados)
+            estado    = "OK" if not errores else "ERRORES"
+            print(f"Tirada {i+1}: {', '.join(etiquetas)} Total = {total}  [{estado}]")
+            for e in errores:
+                print(f"MAL: {e}")
+
+    print(f"\n  Salida en: {carpeta_salida}\n")
+
+
+if __name__ == '__main__':
+    main()
